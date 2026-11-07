@@ -1,0 +1,26 @@
+[package]
+name = "bre-pair"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+default-run = "brepair"
+description = "Memory-bounded batched Re-Pair training and byte-exact tokenization"
+license = "Apache-2.0"
+repository = "https://github.com/kapenga/bre-pair"
+
+[profile.release]
+debug = true
+
+[profile.dist]
+inherits = "release"
+debug = false
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+
+[dependencies]
+
+[features]
+profile = []
+audit = []
+huffman-kernels = ["profile"]

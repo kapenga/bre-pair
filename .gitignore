@@ -1,0 +1,17 @@
+/target/
+/results/
+/dist/
+*.brp
+*.mrp
+*.brt
+*.brm
+*.bts
+*.brh
+*.brhv
+*.brc
+*.partial
+*.partial.*
+*.work/
+__pycache__/
+*.py[cod]
+/.venv/
