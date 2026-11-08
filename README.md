@@ -74,6 +74,27 @@ brepair huffman-repack archive.brh compact.brh --rule-lengths runs --memory 2GB
 The repacker retains the earlier representation when it is smaller. All
 supported representations use the same reconstruction engine.
 
+## Decode independent fields through the library
+
+`shared_huffman::StaticModel` can prepare one immutable decoder for many
+EOF-terminated fields. `decode_field_into` writes directly into a caller-owned
+slice and returns `(bytes_written, bits_consumed, coded_symbols)`. The slice
+length bounds output; caller padding is unnecessary. Its unused capacity is
+scratch and may be overwritten. Consume only `output[..bytes_written]` and
+discard partial output if decoding fails. Share the model/prepared decoder
+between workers, with separate output buffers.
+
+Block decoding handles mixed cached/uncached expansions and checks exact byte,
+field and terminal-ID totals. The richer shared lookup table is initialized
+on first block use; it adds 16 bytes per coded leaf when needed. The expansion
+arena remains bounded, and uncached rules use iterative expansion. All supported
+archive layouts retain the same canonical Huffman bit decoder.
+
+The `bytecode-experiments` Cargo feature exposes research-only byte-aligned
+and fixed-rank payload helpers; it is disabled by default. The `bytecode-speed`,
+`record-decode` and `record-replay` binaries are benchmark harnesses with explicit
+input contracts, rather than normal file-compression commands.
+
 ## Train and apply a tokenizer
 
 ```sh

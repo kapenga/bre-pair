@@ -24,3 +24,4 @@ codegen-units = 1
 profile = []
 audit = []
 huffman-kernels = ["profile"]
+bytecode-experiments = []

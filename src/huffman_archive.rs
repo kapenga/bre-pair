@@ -3,14 +3,14 @@
 //! and a u64 index. Fixed-width BRTOKS01 and BRPAIR01 remain unchanged.
 use crate::{
     huffman::{Codebook, Encoding},
-    huffman_dictionary::{Arena, DecodeGraph, Dictionary},
+    huffman_dictionary::{Arena, DecodeGraph, Dictionary, ExpansionReference},
     tokenizer::{fingerprint, Tokenizer},
 };
 use std::{
     fs::File,
     io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::Path,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 pub const DEFAULT_BLOCK_SYMBOLS: usize = 1 << 20;
@@ -382,6 +382,8 @@ pub struct PreparedDecoder {
     arena: Arena,
     book: Option<Arc<Codebook>>,
     references: Option<Vec<(u32, u32)>>,
+    field_references: Option<Vec<(u32, u32)>>,
+    expansions: OnceLock<Option<Vec<ExpansionReference>>>,
     token_ids: bool,
 }
 impl PreparedDecoder {
@@ -417,11 +419,41 @@ impl PreparedDecoder {
             arena,
             book,
             references,
+            field_references: None,
+            expansions: OnceLock::new(),
             token_ids,
         })
     }
     pub fn arena_bytes(&self) -> usize {
         self.arena.allocated_bytes()
+    }
+    pub(crate) fn prepare_field_references<G: DecodeGraph>(&mut self, dictionary: &G) {
+        if self.references.is_none() && !self.token_ids {
+            self.field_references = self
+                .book
+                .as_ref()
+                .and_then(|b| self.arena.field_references(dictionary, &b.symbols));
+        }
+    }
+    /// Immutable tables for the opt-in byte-aligned coding experiment.
+    #[cfg(feature = "bytecode-experiments")]
+    pub fn bytecode_tables(&self) -> Result<crate::bytecode::Tables<'_>, String> {
+        if self.token_ids {
+            return Err("bytecode experiment requires byte expansions".into());
+        }
+        Ok((
+            self.arena.data(),
+            self.references
+                .as_deref()
+                .or(self.field_references.as_deref())
+                .ok_or("arena budget does not cache every coded expansion")?,
+        ))
+    }
+    /// Reproduce the former generic byte-expansion path as an experiment control.
+    #[cfg(feature = "bytecode-experiments")]
+    pub fn experiment_force_graph_fallback(&mut self) {
+        self.references = None;
+        self.field_references = None;
     }
     pub(crate) fn uses_codebook(&self, book: &Arc<Codebook>) -> bool {
         self.book.as_ref().is_some_and(|own| Arc::ptr_eq(own, book))
@@ -454,7 +486,7 @@ impl PreparedDecoder {
             .as_ref()
             .ok_or("EOF field API requires a static table")?;
         out.clear();
-        if let Some(references) = &self.references {
+        if let Some(references) = self.references.as_ref().or(self.field_references.as_ref()) {
             book.decode_field_ranks(payload, |rank| {
                 let (offset, flags) = references[rank as usize];
                 let length = (flags & 0x7fff_ffff) as usize;
@@ -482,6 +514,72 @@ impl PreparedDecoder {
             })
         }
     }
+    /// Decode a field directly into caller-owned memory. Returns
+    /// (bytes written, actual bits, actual symbols). No padding is required;
+    /// bytes beyond the returned length are scratch and may be overwritten.
+    /// On failure discard partial output. The dictionary must match preparation.
+    pub fn decode_field_into(
+        &self,
+        dictionary: &Dictionary,
+        payload: &[u8],
+        out: &mut [u8],
+    ) -> Result<(usize, u64, u64), String> {
+        self.decode_graph_field_into(dictionary, payload, out)
+    }
+    pub(crate) fn decode_graph_field_into<G: DecodeGraph>(
+        &self,
+        dictionary: &G,
+        payload: &[u8],
+        out: &mut [u8],
+    ) -> Result<(usize, u64, u64), String> {
+        if self.token_ids {
+            return Err("EOF field API requires byte output".into());
+        }
+        let book = self
+            .book
+            .as_ref()
+            .ok_or("EOF field API requires a static table")?;
+        let mut used = 0usize;
+        let (bits, symbols) =
+            if let Some(references) = self.references.as_ref().or(self.field_references.as_ref()) {
+                book.decode_field_ranks(payload, |rank| {
+                    let (offset, flags) = references[rank as usize];
+                    let length = (flags & 0x7fff_ffff) as usize;
+                    let remaining = out.len() - used;
+                    if length > remaining {
+                        return Err("field exceeds output limit".into());
+                    }
+                    if length != 0 {
+                        let copied = if length <= 16 && remaining >= 16 {
+                            16
+                        } else {
+                            length
+                        };
+                        let start = offset as usize;
+                        out[used..used + copied]
+                            .copy_from_slice(&self.arena.data()[start..start + copied]);
+                        used += length;
+                    }
+                    Ok(flags >> 31 != 0)
+                })?
+            } else {
+                let mut stack = Vec::new();
+                book.decode_field_ranks(payload, |rank| {
+                    let id = book.symbols[rank as usize];
+                    let expansion = dictionary.expansions()[id as usize];
+                    if expansion.bytes > (out.len() - used) as u64 {
+                        return Err("field exceeds output limit".into());
+                    }
+                    self.arena.emit_graph(dictionary, id, &mut stack, |bytes| {
+                        out[used..used + bytes.len()].copy_from_slice(bytes);
+                        used += bytes.len();
+                        Ok(())
+                    })?;
+                    Ok(expansion.ends_field)
+                })?
+            };
+        Ok((used, bits, symbols))
+    }
     pub fn decode_block(
         &self,
         dictionary: &Dictionary,
@@ -506,17 +604,31 @@ impl PreparedDecoder {
                 &self.arena,
                 block,
                 self.references.as_deref(),
+                if self.references.is_none() {
+                    self.expansions
+                        .get_or_init(|| self.arena.ranked_expansions(dictionary, &book.symbols))
+                        .as_deref()
+                } else {
+                    None
+                },
                 out,
             )
         } else {
             let references = self
                 .arena
                 .ranked_references(dictionary, &block.book.symbols);
+            let expansions = if references.is_none() {
+                self.arena
+                    .ranked_expansions(dictionary, &block.book.symbols)
+            } else {
+                None
+            };
             MemoryReader::decode_prepared(
                 dictionary,
                 &self.arena,
                 block,
                 references.as_deref(),
+                expansions.as_deref(),
                 out,
             )
         }
@@ -995,13 +1107,26 @@ impl<R: Read + Seek> Reader<R> {
         out: &mut impl Write,
     ) -> Result<bool, String> {
         let references = arena.ranked_references(dictionary, &block.book.symbols);
-        Self::decode_prepared(dictionary, arena, block, references.as_deref(), out)
+        let expansions = if references.is_none() {
+            arena.ranked_expansions(dictionary, &block.book.symbols)
+        } else {
+            None
+        };
+        Self::decode_prepared(
+            dictionary,
+            arena,
+            block,
+            references.as_deref(),
+            expansions.as_deref(),
+            out,
+        )
     }
     fn decode_prepared<G: DecodeGraph>(
         dictionary: &G,
         arena: &Arena,
         block: &Block,
         references: Option<&[(u32, u32)]>,
+        expansions: Option<&[ExpansionReference]>,
         out: &mut impl Write,
     ) -> Result<bool, String> {
         if let Some(references) = references {
@@ -1024,6 +1149,67 @@ impl<R: Read + Seek> Reader<R> {
             block.totals.bytes
         };
         let mut buffer = Vec::with_capacity(output_bytes.clamp(16, 1 << 20) as usize);
+        if let Some(expansions) = expansions {
+            // A single uncached rule must not force every coded symbol through
+            // graph dispatch. Rich references retain exact terminal counts for
+            // AI grammars, and mark only uncached expansions for that fallback.
+            let capacity = buffer.capacity();
+            buffer.resize(capacity + 16, 0);
+            let mut used = 0usize;
+            let mut append = |source: &[u8], length: usize| -> Result<(), String> {
+                if length == 0 {
+                    return Ok(());
+                }
+                if length > capacity - used {
+                    out.write_all(&buffer[..used]).map_err(error)?;
+                    used = 0;
+                }
+                if length >= capacity {
+                    out.write_all(&source[..length]).map_err(error)?;
+                } else {
+                    let copied = if length <= 16 && source.len() >= 16 {
+                        16
+                    } else {
+                        length
+                    };
+                    buffer[used..used + copied].copy_from_slice(&source[..copied]);
+                    used += length;
+                }
+                Ok(())
+            };
+            block
+                .book
+                .decode_ranks(&block.payload, block.bits, block.totals.symbols, |rank| {
+                    let r = &expansions[rank as usize];
+                    if r.length == u32::MAX {
+                        ended = totals.add_symbol(dictionary, r.offset)?;
+                    } else {
+                        ended = r.byte_flags >> 31 != 0;
+                        totals.add(Totals {
+                            bytes: u64::from(r.byte_flags & 0x7fff_ffff),
+                            fields: u64::from(ended),
+                            tokens: u64::from(r.terminals),
+                            symbols: 1,
+                        })?;
+                    }
+                    if totals.exceeds(&block.totals) {
+                        return Err("decoded block exceeds declared totals".into());
+                    }
+                    if r.length == u32::MAX {
+                        arena.emit_graph(dictionary, r.offset, &mut pending, |bytes| {
+                            append(bytes, bytes.len())
+                        })?;
+                    } else {
+                        append(&arena.data()[r.offset as usize..], r.length as usize)?;
+                    }
+                    Ok(())
+                })?;
+            if totals != block.totals {
+                return Err("decoded Huffman totals mismatch".into());
+            }
+            out.write_all(&buffer[..used]).map_err(error)?;
+            return Ok(ended);
+        }
         block
             .book
             .decode(&block.payload, block.bits, block.totals.symbols, |id| {

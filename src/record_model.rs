@@ -215,7 +215,14 @@ impl StaticModel {
         token_ids: bool,
         budget: usize,
     ) -> Result<PreparedDecoder, String> {
-        PreparedDecoder::from_graph(&self.graph, Some(Arc::clone(&self.book)), token_ids, budget)
+        let mut decoder = PreparedDecoder::from_graph(
+            &self.graph,
+            Some(Arc::clone(&self.book)),
+            token_ids,
+            budget,
+        )?;
+        decoder.prepare_field_references(&self.graph);
+        Ok(decoder)
     }
     pub fn decode_block(
         &self,
@@ -238,6 +245,21 @@ impl StaticModel {
             return Err("field uses a different static table".into());
         }
         decoder.decode_graph_field(&self.graph, payload, maximum_output, out)
+    }
+    /// Decode directly into a bounded caller buffer, without a temporary field
+    /// vector. Returns (bytes written, actual bits, actual symbols). No guard
+    /// bytes are needed; discard partial output on error. Unused capacity may
+    /// be overwritten by short copies and must not contain live data.
+    pub fn decode_field_into(
+        &self,
+        decoder: &PreparedDecoder,
+        payload: &[u8],
+        out: &mut [u8],
+    ) -> Result<(usize, u64, u64), String> {
+        if !decoder.uses_codebook(&self.book) {
+            return Err("field uses a different static table".into());
+        }
+        decoder.decode_graph_field_into(&self.graph, payload, out)
     }
 }
 
@@ -269,6 +291,68 @@ mod tests {
                 symbols: 500,
             },
         }
+    }
+    #[test]
+    fn direct_field_output_needs_no_guard_and_preserves_limits_and_model_identity() {
+        let model = StaticModel::from_bytes(
+            &StaticModel::encode_frozen(&fixture(), RuleLengths::Auto).unwrap(),
+        )
+        .unwrap();
+        let matcher = model.prepare().unwrap();
+        for budget in [0, 1, 65536] {
+            let decoder = model.prepare_decoder(false, budget).unwrap();
+            for raw in [
+                vec![],
+                b"abc".to_vec(),
+                vec![0, 255],
+                b"abcabcabcabcabcabcabc".to_vec(),
+            ] {
+                let mut terminals: Vec<u32> = raw.iter().map(|&b| u32::from(b)).collect();
+                terminals.push(256);
+                let ids = matcher.segment(&terminals).unwrap();
+                let (payload, bits) = model.codebook().encode(&ids).unwrap();
+                for extra in [0, 1, 15, 16, 31] {
+                    // Sentinels outside the provided slice must remain intact,
+                    // even when the logical output ends on a short copy.
+                    let mut out = vec![0xa5; raw.len() + extra + 2];
+                    let end = out.len() - 1;
+                    assert_eq!(
+                        model
+                            .decode_field_into(&decoder, &payload, &mut out[1..end])
+                            .unwrap(),
+                        (raw.len(), bits, ids.len() as u64)
+                    );
+                    assert_eq!(&out[1..1 + raw.len()], raw);
+                    assert_eq!(out[0], 0xa5);
+                    assert_eq!(out[end], 0xa5);
+                }
+                if !raw.is_empty() {
+                    assert!(model
+                        .decode_field_into(&decoder, &payload, &mut vec![0; raw.len() - 1])
+                        .is_err());
+                }
+                for end in 0..payload.len() {
+                    assert!(model
+                        .decode_field_into(&decoder, &payload[..end], &mut vec![0; raw.len()])
+                        .is_err());
+                }
+                let mut trailing = payload;
+                trailing.push(0);
+                assert!(model
+                    .decode_field_into(&decoder, &trailing, &mut vec![0; raw.len()])
+                    .is_err());
+            }
+        }
+        let other = StaticModel::from_bytes(
+            &StaticModel::encode_frozen(&fixture(), RuleLengths::Auto).unwrap(),
+        )
+        .unwrap();
+        assert!(model
+            .decode_field_into(&other.prepare_decoder(false, 65536).unwrap(), &[], &mut [])
+            .is_err());
+        assert!(model
+            .decode_field_into(&model.prepare_decoder(true, 65536).unwrap(), &[], &mut [])
+            .is_err());
     }
     #[test]
     fn compact_model_eof_api_handles_cached_and_uncached_compound_endings() {
@@ -329,9 +413,9 @@ mod tests {
                     tokens: field.len() as u64,
                     symbols: encoded.len() as u64,
                 };
-                for ids in [false, true] {
-                    let decoder = restored.prepare_decoder(ids, 65536).unwrap();
-                    let block = Block {
+                for (ids, budget) in [(false, 0), (false, 65536), (true, 0), (true, 65536)] {
+                    let decoder = restored.prepare_decoder(ids, budget).unwrap();
+                    let mut block = Block {
                         book: Arc::clone(&book),
                         payload: payload.clone(),
                         bits,
@@ -349,6 +433,17 @@ mod tests {
                             .collect()
                     };
                     assert_eq!(out, expected);
+                    // A cached merged expansion can represent many terminal
+                    // AI IDs. Declared tokens must never be inferred from the
+                    // smaller number of coded symbols, even on this fast path.
+                    block.totals.tokens += 1;
+                    assert!(restored
+                        .decode_block(&decoder, &block, &mut Vec::new())
+                        .is_err());
+                    block.totals.tokens -= 2;
+                    assert!(restored
+                        .decode_block(&decoder, &block, &mut Vec::new())
+                        .is_err());
                 }
             }
         }

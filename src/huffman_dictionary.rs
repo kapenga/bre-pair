@@ -326,6 +326,24 @@ impl Arena {
         if dictionary.ai_tokens() && dictionary.has_rules() {
             return None;
         }
+        self.references_for(dictionary, ids)
+    }
+    /// EOF byte fields do not infer AI-token totals from coded-symbol counts.
+    pub(crate) fn field_references<G: DecodeGraph>(
+        &self,
+        dictionary: &G,
+        ids: &[u32],
+    ) -> Option<Vec<(u32, u32)>> {
+        if self.token_ids {
+            return None;
+        }
+        self.references_for(dictionary, ids)
+    }
+    fn references_for<G: DecodeGraph>(
+        &self,
+        dictionary: &G,
+        ids: &[u32],
+    ) -> Option<Vec<(u32, u32)>> {
         ids.iter()
             .map(|&id| {
                 if self.token_ids {
@@ -421,6 +439,19 @@ impl Arena {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn eof_byte_fields_can_cache_ai_grammar_without_changing_block_or_id_path() {
+        let dictionary = Dictionary::new(byte_model(), vec![(97, 98), (257, 256)], true).unwrap();
+        let arena = Arena::new(&dictionary, false, 65536).unwrap();
+        assert!(arena.ranked_references(&dictionary, &[258]).is_none());
+        let field = arena.field_references(&dictionary, &[258]).unwrap();
+        assert_eq!(field[0].1, 0x80000002);
+        let ids = Arena::new(&dictionary, true, 65536).unwrap();
+        assert!(ids.field_references(&dictionary, &[258]).is_none());
+        assert!(ids.ranked_references(&dictionary, &[258]).is_none());
+        let uncached = Arena::new(&dictionary, false, 0).unwrap();
+        assert!(uncached.field_references(&dictionary, &[258]).is_none());
+    }
     #[test]
     fn shared_subslices_and_uncached_fallback_preserve_both_outputs() {
         let model = byte_model();

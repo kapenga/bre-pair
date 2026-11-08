@@ -8,6 +8,8 @@ pub mod atomic_output;
 mod audit;
 pub mod batch;
 mod batch_experiments;
+#[cfg(feature = "bytecode-experiments")]
+pub mod bytecode;
 pub mod codec;
 pub mod context_entropy;
 pub mod disk_seed;
