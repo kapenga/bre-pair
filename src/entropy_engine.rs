@@ -59,6 +59,33 @@ pub struct ResultSet {
     pub stopped_at_round_limit: bool,
 }
 
+/// Shared experimental trainer, independent of how raw boundary scores were
+/// estimated. Scores are Q24 values stored exactly in float32 buffers.
+pub struct BoundaryTraining {
+    pub training: Training,
+    pub annotation_seconds: f64,
+    pub discovery_seconds: f64,
+    pub initial_weight_bytes: usize,
+    pub final_weight_bytes: usize,
+    pub initial_weight_capacity_bytes: usize,
+    pub final_weight_capacity_bytes: usize,
+    pub mean_initial_weight: f64,
+    pub zero_weights: u64,
+    pub peak_pair_entries: usize,
+    pub stopped_at_rule_limit: bool,
+    pub stopped_at_round_limit: bool,
+    pub initial_loss_units: u128,
+    pub final_loss_units: u128,
+    pub losses: Vec<BoundaryRound>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BoundaryRound {
+    pub before_units: u128,
+    pub removed_units: u128,
+    pub after_units: u128,
+}
+
 struct Buffers {
     blocks: Vec<PackedSymbols>,
     weights: Vec<Vec<f32>>,
@@ -71,7 +98,7 @@ fn rewrite(
     replacements: &PairMap<Symbol>,
     width: u8,
     writer: &mut Writer<'_>,
-) -> Result<(), String> {
+) -> Result<u128, String> {
     debug_assert_eq!(block.len(), weights.len());
     let end = block.len();
     let mut output = (width != block.width()).then(|| PackedSymbols::with_capacity(width, end));
@@ -79,6 +106,7 @@ fn rewrite(
     let mut read = 0;
     let mut written = 0;
     let mut position = Position::default();
+    let mut removed_units = 0;
     while read < end {
         let a = block.get(read);
         let weight = weights[read]; // Incoming boundary of the first child.
@@ -86,6 +114,7 @@ fn rewrite(
             .then(|| block.get(read + 1))
             .and_then(|b| replacements.get(&(a, b)).copied());
         let emitted = if let Some(symbol) = replacement {
+            removed_units += u128::from(weight_units(weights[read + 1]));
             read += 2;
             symbol
         } else {
@@ -115,7 +144,7 @@ fn rewrite(
     if weights.capacity() / 2 > weights.len() {
         weights.shrink_to_fit();
     }
-    Ok(())
+    Ok(removed_units)
 }
 
 fn parallel_rewrite(
@@ -125,7 +154,7 @@ fn parallel_rewrite(
     grammar: &Grammar,
     replacements: &PairMap<Symbol>,
     width: u8,
-) -> Result<Buffers, String> {
+) -> Result<(Buffers, u128), String> {
     let count = buffers.blocks.len();
     let jobs = Mutex::new(buffers.blocks.into_iter().zip(buffers.weights).enumerate());
     let mut results = std::thread::scope(|scope| {
@@ -143,7 +172,7 @@ fn parallel_rewrite(
                     let Some((index, (mut block, mut weights))) = job else {
                         break;
                     };
-                    rewrite(
+                    let removed_units = rewrite(
                         &mut block,
                         &mut weights,
                         grammar,
@@ -151,7 +180,7 @@ fn parallel_rewrite(
                         width,
                         &mut writer,
                     )?;
-                    result.push((index, block, weights));
+                    result.push((index, block, weights, removed_units));
                 }
                 writer.flush()?;
                 Ok::<_, String>(result)
@@ -163,12 +192,13 @@ fn parallel_rewrite(
         }
         Ok::<_, String>(result)
     })?;
-    results.sort_unstable_by_key(|&(index, _, _)| index);
+    results.sort_unstable_by_key(|&(index, _, _, _)| index);
+    let removed_units = results.iter().map(|r| r.3).sum();
     let (blocks, weights) = results
         .into_iter()
-        .map(|(_, block, weights)| (block, weights))
+        .map(|(_, block, weights, _)| (block, weights))
         .unzip();
-    Ok(Buffers { blocks, weights })
+    Ok((Buffers { blocks, weights }, removed_units))
 }
 
 pub fn compress(
@@ -176,6 +206,65 @@ pub fn compress(
     options: &Options,
     mut on_round: impl FnMut(&Round),
 ) -> Result<ResultSet, String> {
+    let started = Instant::now();
+    let model = Model::train(fields, options.context)?;
+    let context_statistics = model.statistics;
+    let statistics_seconds = started.elapsed().as_secs_f64();
+    let mut backoff_by_order = [0u64; 7];
+    let backoff = &mut backoff_by_order;
+    let mut result = compress_boundaries(
+        fields,
+        options,
+        move |field| {
+            let mut history = History::default();
+            let mut weights = Vec::with_capacity(field.len() + 1);
+            for (index, symbol) in field.iter().map(|&b| u32::from(b)).chain([EOF]).enumerate() {
+                weights.push(if index == 0 {
+                    0.0
+                } else {
+                    let (weight, order) = model.weight(&history);
+                    backoff[order] += 1;
+                    weight
+                });
+                if symbol != EOF {
+                    history.push(symbol as u8, model.order());
+                }
+            }
+            Ok(weights)
+        },
+        |round, _| on_round(round),
+    )?;
+    result.training.seconds += statistics_seconds;
+    Ok(ResultSet {
+        training: result.training,
+        context_statistics,
+        statistics_seconds,
+        annotation_seconds: result.annotation_seconds,
+        discovery_seconds: result.discovery_seconds,
+        initial_weight_bytes: result.initial_weight_bytes,
+        final_weight_bytes: result.final_weight_bytes,
+        initial_weight_capacity_bytes: result.initial_weight_capacity_bytes,
+        final_weight_capacity_bytes: result.final_weight_capacity_bytes,
+        mean_initial_weight: result.mean_initial_weight,
+        zero_weights: result.zero_weights,
+        backoff_by_order,
+        peak_pair_entries: result.peak_pair_entries,
+        stopped_at_rule_limit: result.stopped_at_rule_limit,
+        stopped_at_round_limit: result.stopped_at_round_limit,
+    })
+}
+
+/// Score only the joins actually removed by compatible forward replacements.
+/// The annotator returns incoming scores for each byte plus final EOF, resets
+/// at every field, and is dropped before discovery to release its statistics.
+/// Zero-gain candidates remain eligible at the ordinary support floor; the
+/// shared selector breaks equal priorities by replacement frequency.
+pub fn compress_boundaries(
+    fields: &[Vec<u8>],
+    options: &Options,
+    mut annotate: impl FnMut(&[u8]) -> Result<Vec<f32>, String>,
+    mut on_round: impl FnMut(&Round, &BoundaryRound),
+) -> Result<BoundaryTraining, String> {
     if !(1..=256).contains(&options.workers)
         || options.chunk_symbols == 0
         || options.minimum_count < 2
@@ -197,9 +286,6 @@ pub fn compress(
         .checked_mul(4)
         .ok_or("weight buffer size overflow")?;
     let started = Instant::now();
-    let model = Model::train(fields, options.context)?;
-    let context_statistics = model.statistics;
-    let statistics_seconds = started.elapsed().as_secs_f64();
     let annotated = Instant::now();
     let mut registry = Registry::new();
     let mut writer = registry.writer();
@@ -230,26 +316,29 @@ pub fn compress(
     let grammar = Grammar::default();
     let mut weight_sum = 0f64;
     let mut zero_weights = 0;
-    let mut backoff_by_order = [0u64; 7];
+    let mut initial_loss_units = 0u128;
+    let mut observations = 0u64;
     for field in fields {
-        let mut history = History::default();
+        let annotated = annotate(field)?;
+        if annotated.len() != field.len() + 1 || annotated[0] != 0.0 {
+            return Err("boundary annotation must match bytes plus EOF and start at zero".into());
+        }
         for (index, symbol) in field.iter().map(|&b| u32::from(b)).chain([EOF]).enumerate() {
-            let weight = if index == 0 {
-                0.0
-            } else {
-                let (weight, order) = model.weight(&history);
-                backoff_by_order[order] += 1;
+            let weight = annotated[index];
+            let scaled = weight * context_entropy::WEIGHT_SCALE as f32;
+            if !(0.0..=1.0).contains(&weight) || scaled != scaled.trunc() {
+                return Err("boundary annotation must contain finite Q24 values in 0..=1".into());
+            }
+            initial_loss_units += u128::from(weight_units(weight));
+            if index > 0 {
+                observations += 1;
                 weight_sum += f64::from(weight);
                 zero_weights += u64::from(weight == 0.0);
-                weight
-            };
+            }
             block.push(symbol);
             weights.push(weight);
             if let Edge::Pair(pair) = position.advance(symbol, &grammar, false) {
                 writer.push(pair, weight_units(weight))?;
-            }
-            if symbol != EOF {
-                history.push(symbol as u8, model.order());
             }
         }
         if block.len() >= options.chunk_symbols {
@@ -266,7 +355,7 @@ pub fn compress(
     }
     writer.flush()?;
     drop(writer);
-    drop(model); // No predictor is needed after the second source pass.
+    drop(annotate); // No source predictor is needed after annotation.
     let initial_weight_capacity_bytes = buffers.weights.iter().map(|w| w.capacity() * 4).sum();
     let annotation_seconds = annotated.elapsed().as_secs_f64();
     let discovery_started = Instant::now();
@@ -280,6 +369,8 @@ pub fn compress(
         .sum();
     let mut stopped_at_rule_limit = false;
     let mut stopped_at_round_limit = false;
+    let mut loss_units = initial_loss_units;
+    let mut losses = Vec::new();
     #[cfg(any(test, feature = "audit"))]
     let original_weights = buffers.weights.clone();
     loop {
@@ -351,7 +442,7 @@ pub fn compress(
             return Err("entropy rewrite exceeds the packed budget".into());
         }
         registry.clear();
-        buffers = parallel_rewrite(
+        let (rewritten_buffers, removed_units) = parallel_rewrite(
             buffers,
             options.workers,
             &registry,
@@ -359,6 +450,15 @@ pub fn compress(
             &replacements,
             width,
         )?;
+        buffers = rewritten_buffers;
+        let loss = BoundaryRound {
+            before_units: loss_units,
+            removed_units,
+            after_units: loss_units
+                .checked_sub(removed_units)
+                .ok_or("boundary loss underflow")?,
+        };
+        loss_units = loss.after_units;
         let rewritten = buffers.blocks.iter().map(PackedSymbols::len).sum::<usize>();
         if rewritten != predicted {
             return Err("weighted replacement counts disagree with output".into());
@@ -400,7 +500,8 @@ pub fn compress(
             rewrite_seconds: rewrite_started.elapsed().as_secs_f64(),
             refill_seconds: 0.0,
         };
-        on_round(&round);
+        on_round(&round, &loss);
+        losses.push(loss);
         rounds.push(round);
         stopped_at_rule_limit = options
             .max_rules
@@ -422,8 +523,16 @@ pub fn compress(
     let final_weight_bytes = buffers.weights.iter().map(|w| w.len() * 4).sum();
     let final_weight_capacity_bytes = buffers.weights.iter().map(|w| w.capacity() * 4).sum();
     let discovery_seconds = discovery_started.elapsed().as_secs_f64();
-    let observations = backoff_by_order.iter().sum::<u64>();
-    Ok(ResultSet {
+    let final_loss_units = buffers
+        .weights
+        .iter()
+        .flatten()
+        .map(|&weight| u128::from(weight_units(weight)))
+        .sum();
+    if final_loss_units != loss_units {
+        return Err("surviving boundary loss disagrees with actual removed joins".into());
+    }
+    Ok(BoundaryTraining {
         training: Training {
             compressed: Compressed {
                 grammar,
@@ -439,8 +548,6 @@ pub fn compress(
             seconds: started.elapsed().as_secs_f64(),
             pruning: None,
         },
-        context_statistics,
-        statistics_seconds,
         annotation_seconds,
         discovery_seconds,
         initial_weight_bytes,
@@ -453,10 +560,12 @@ pub fn compress(
             weight_sum / observations as f64
         },
         zero_weights,
-        backoff_by_order,
         peak_pair_entries,
         stopped_at_rule_limit,
         stopped_at_round_limit,
+        initial_loss_units,
+        final_loss_units,
+        losses,
     })
 }
 

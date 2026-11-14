@@ -36,9 +36,23 @@ pub(crate) fn scan(
 }
 
 pub(crate) fn select(
+    candidates: Vec<Candidate>,
+    options: &Options,
+    scan_edges: impl Fn(&PairMap<usize>, &(dyn Fn(usize, usize) + Sync)),
+) -> Selection {
+    select_observed(
+        candidates,
+        options,
+        scan_edges,
+        crate::training_progress::wave,
+    )
+}
+
+fn select_observed(
     mut candidates: Vec<Candidate>,
     options: &Options,
     scan_edges: impl Fn(&PairMap<usize>, &(dyn Fn(usize, usize) + Sync)),
+    mut on_wave: impl FnMut(usize, &[Candidate]),
 ) -> Selection {
     assert_eq!(
         options.frequency_override_percent, 0,
@@ -127,6 +141,7 @@ pub(crate) fn select(
             ties.into_inner().expect("poisoned tie set"),
             options,
         );
+        on_wave(usize::from(wave) + 1, &next.pairs);
         if next.pairs.is_empty() {
             break;
         }
@@ -205,6 +220,79 @@ pub(crate) fn select(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn negative_priorities_remain_eligible_and_use_signed_order() {
+        let candidates = vec![
+            Candidate {
+                pair: (1, 2),
+                count: 8,
+                priority: -1.0,
+            },
+            Candidate {
+                pair: (2, 3),
+                count: 16,
+                priority: -2.0,
+            },
+            Candidate {
+                pair: (3, 4),
+                count: 32,
+                priority: -3.0,
+            },
+        ];
+        let options = Options {
+            fill_waves: 2,
+            fill_min_count: 8,
+            ..Options::default()
+        };
+        let result = select(candidates, &options, |index, edge| {
+            scan([1, 2, 3, 4].into_iter(), index, edge);
+        });
+        // Signed priorities select AB first; wave two releases CD. Neither
+        // negative values nor their negative sum imply count exhaustion.
+        let mut pairs = result.pairs.iter().map(|c| c.pair).collect::<Vec<_>>();
+        pairs.sort_unstable();
+        assert_eq!(pairs, [(1, 2), (3, 4)]);
+        assert_eq!(result.score, 40);
+    }
+
+    #[test]
+    fn wave_observer_preserves_selection_and_counts_released_candidates() {
+        let large = u64::from(u32::MAX) + 1;
+        let candidates: Vec<_> = [(1, 2), (2, 3), (3, 4)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, pair)| Candidate {
+                pair,
+                count: large,
+                priority: (3 - i) as f64,
+            })
+            .collect();
+        let options = Options {
+            fill_waves: 2,
+            ..Default::default()
+        };
+        let scan_edges = |index: &PairMap<usize>, edge: &(dyn Fn(usize, usize) + Sync)| {
+            scan([1, 2, 3, 4].into_iter(), index, edge);
+        };
+        let mut waves = Vec::new();
+        let observed =
+            select_observed(candidates.clone(), &options, scan_edges, |number, pairs| {
+                waves.push((
+                    number,
+                    pairs.len(),
+                    pairs.iter().map(|p| p.count).sum::<u64>(),
+                ));
+            });
+        let ordinary = select(candidates, &options, scan_edges);
+        assert_eq!(waves, [(1, 1, large), (2, 1, large)]);
+        assert_eq!(
+            observed.pairs.iter().map(|c| c.pair).collect::<Vec<_>>(),
+            ordinary.pairs.iter().map(|c| c.pair).collect::<Vec<_>>()
+        );
+        assert_eq!(observed.score, ordinary.score);
+        assert_eq!(waves.iter().map(|w| w.2).sum::<u64>(), observed.score);
+    }
 
     #[test]
     fn high_fill_floor_needs_no_extra_corpus_scan() {

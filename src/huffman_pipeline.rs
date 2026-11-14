@@ -39,7 +39,7 @@ impl Options {
         if !(1..=8).contains(&self.buffers_per_stage)
             || !(1..=1 << 20).contains(&self.references_per_buffer)
             || !(1..=16 << 20).contains(&self.output_buffer_bytes)
-            || self.arena_bytes > 64 << 20
+            || self.arena_bytes > 1 << 30
         {
             return Err("invalid Huffman pipeline buffer limits".into());
         }

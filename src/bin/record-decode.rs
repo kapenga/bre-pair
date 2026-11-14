@@ -3,6 +3,33 @@
 use bre_pair::shared_huffman::StaticModel;
 use std::{fs, thread, time::Instant};
 
+fn process_cpu_seconds() -> Result<Option<f64>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        #[repr(C)]
+        struct Timespec {
+            seconds: std::os::raw::c_long,
+            nanoseconds: std::os::raw::c_long,
+        }
+        extern "C" {
+            fn clock_gettime(clock: i32, value: *mut Timespec) -> i32;
+        }
+        let mut value = Timespec {
+            seconds: 0,
+            nanoseconds: 0,
+        };
+        // CLOCK_PROCESS_CPUTIME_ID includes all decoder threads, user+system.
+        if unsafe { clock_gettime(2, &mut value) } != 0 {
+            return Err("process CPU clock failed".into());
+        }
+        Ok(Some(value.seconds as f64 + value.nanoseconds as f64 * 1e-9))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(None)
+    }
+}
+
 fn pin(core: usize) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
@@ -22,8 +49,8 @@ fn pin(core: usize) -> Result<(), String> {
 }
 fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if args.len() != 5 {
-        return Err("record-decode MODEL FRAMES INDEX RAW WORKERS(1|4)".into());
+    if ![5, 6].contains(&args.len()) {
+        return Err("record-decode MODEL FRAMES INDEX RAW WORKERS(1|4) [ARENA_MIB]".into());
     }
     let workers: usize = args[4].parse().map_err(|_| "invalid workers")?;
     if ![1, 4].contains(&workers) {
@@ -32,7 +59,13 @@ fn run() -> Result<(), String> {
     let read = |p: &str| fs::read(p).map_err(|e| e.to_string());
     let stored = read(&args[0])?;
     let model = StaticModel::from_bytes(&stored)?;
-    let decoder = model.prepare_decoder(false, 64 << 20)?;
+    let arena_mib: usize = args
+        .get(5)
+        .map_or(Ok(64), |s| s.parse().map_err(|_| "invalid arena cap"))?;
+    let decoder = model.prepare_decoder(
+        false,
+        arena_mib.checked_mul(1 << 20).ok_or("arena cap overflow")?,
+    )?;
     let coded = read(&args[1])?;
     let saved = read(&args[2])?;
     if saved.len() % 8 != 0 {
@@ -70,14 +103,15 @@ fn run() -> Result<(), String> {
             let mut output = vec![0xa5u8; raw_offsets[to] - raw_offsets[from] + 16];
             output.fill(0x5a);
             std::hint::black_box(&output);
-            buffers.push((from, to, output));
+            buffers.push((from, to, output, vec![0usize; to - from]));
         }
+        let cpu_before = process_cpu_seconds()?;
         let start = Instant::now();
         let parts = thread::scope(|scope| {
             let jobs: Vec<_> = buffers
                 .into_iter()
                 .enumerate()
-                .map(|(w, (from, to, mut output))| {
+                .map(|(w, (from, to, mut output, mut lengths))| {
                     let (model, decoder, coded, offsets) = (&model, &decoder, &coded, &offsets);
                     scope.spawn(move || -> Result<_, String> {
                         pin(if workers == 1 { 8 } else { [4, 6, 8, 10][w] })?;
@@ -92,12 +126,13 @@ fn run() -> Result<(), String> {
                                 &coded[offsets[i]..offsets[i + 1]],
                                 &mut output[at..at + maximum],
                             )?;
+                            lengths[i - from] = used;
                             at += used;
                         }
                         if at != logical {
                             return Err("partition length mismatch".into());
                         }
-                        Ok((from, to, output))
+                        Ok((from, to, output, lengths))
                     })
                 })
                 .collect();
@@ -106,12 +141,23 @@ fn run() -> Result<(), String> {
                 .collect::<Result<Vec<_>, _>>()
         })?;
         let seconds = start.elapsed().as_secs_f64();
-        for (from, to, output) in parts {
+        let cpu_seconds = match (cpu_before, process_cpu_seconds()?) {
+            (Some(a), Some(b)) => format!("{:.9}", b - a),
+            _ => "null".into(),
+        };
+        for (from, to, output, lengths) in parts {
+            if lengths
+                .iter()
+                .enumerate()
+                .any(|(j, &n)| n != raw_offsets[from + j + 1] - raw_offsets[from + j])
+            {
+                return Err("individual record length differs".into());
+            }
             if output[..output.len() - 16] != raw[raw_offsets[from]..raw_offsets[to]] {
                 return Err("full decoded bytes differ".into());
             }
         }
-        println!("{{\"profile\":\"production-direct\",\"repeat\":{repeat},\"warmup\":{},\"workers\":{workers},\"seconds\":{seconds:.9},\"MBps\":{:.6},\"raw_bytes\":{},\"rows\":{n},\"complete_bytes\":{},\"verified\":true}}",
+        println!("{{\"profile\":\"production-direct\",\"repeat\":{repeat},\"warmup\":{},\"workers\":{workers},\"arena_mib\":{arena_mib},\"cpu_seconds\":{cpu_seconds},\"seconds\":{seconds:.9},\"MBps\":{:.6},\"raw_bytes\":{},\"rows\":{n},\"complete_bytes\":{},\"verified\":true}}",
             repeat == 0, raw.len() as f64 / seconds / 1e6, raw.len(), stored.len()+coded.len()+saved.len());
     }
     Ok(())

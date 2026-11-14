@@ -50,7 +50,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         if bre_pair::shared_huffman::is_format(&magic) {
             let reader = bre_pair::shared_huffman::Reader::new(input)?;
             let s = &reader.stats;
-            println!("{{\"format\":\"{}\",\"static_huffman\":true,\"static_table_bytes\":{},\"static_codes\":{},\"ai_tokens\":{},\"terminal_vocabulary\":{},\"codec_rules\":{},\"dictionary_bytes\":{},\"descriptor_bytes\":{},\"huffman_rule_lengths\":{},\"blocks\":{},\"original_bytes\":{},\"fields\":{},\"terminal_tokens\":{},\"codec_symbols\":{},\"initialization_seconds\":{:.6}}}", s.format(),s.codebook_bytes, s.leaves, reader.ai_tokens, reader.terminal_vocabulary(), s.rules, s.dictionary_bytes,s.descriptor_bytes,s.huffman_rule_lengths,s.blocks, s.totals.bytes, s.totals.fields, s.totals.tokens, s.totals.symbols,start.elapsed().as_secs_f64());
+            println!("{{\"format\":\"{}\",\"static_huffman\":true,\"static_table_bytes\":{},\"static_codes\":{},\"ai_tokens\":{},\"terminal_vocabulary\":{},\"codec_rules\":{},\"dictionary_bytes\":{},\"descriptor_bytes\":{},\"huffman_rule_lengths\":{},\"blocks\":{},\"original_bytes\":{},\"fields\":{},\"terminal_tokens\":{},\"codec_symbols\":{},\"default_decoder\":\"{}\",\"maximum_code_bits\":{},\"initialization_seconds\":{:.6}}}", s.format(),s.codebook_bytes, s.leaves, reader.ai_tokens, reader.terminal_vocabulary(), s.rules, s.dictionary_bytes,s.descriptor_bytes,s.huffman_rule_lengths,s.blocks, s.totals.bytes, s.totals.fields, s.totals.tokens, s.totals.symbols,reader.static_codebook().map_or("none",|book|book.decoder_backend()),reader.static_codebook().map_or(0,|book|book.max_bits),start.elapsed().as_secs_f64());
             return Ok(());
         }
         let reader = Reader::new(input)?;
@@ -65,6 +65,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
     let mut size = DEFAULT_BLOCK_SYMBOLS;
     let mut threads = 1usize;
+    let mut decoder = None;
+    let mut arena_mib = 64usize;
     for option in args[positional..].chunks(2) {
         let value = option.get(1).ok_or("missing Huffman option value")?;
         match option[0].as_str() {
@@ -77,8 +79,25 @@ pub fn run(args: &[String]) -> Result<(), String> {
                     return Err("Huffman decoding supports --threads 1 or 4".into());
                 }
             }
+            "--decoder" if !(encode || pack) => {
+                if !matches!(value.as_str(), "auto" | "scalar" | "avx2") {
+                    return Err("decoder must be auto, scalar or avx2".into());
+                }
+                decoder = Some(value.as_str());
+            }
+            "--arena-mib" if !(encode || pack) => {
+                arena_mib = value.parse().map_err(|_| "invalid arena MiB")?;
+                if arena_mib > 1024 {
+                    return Err("arena MiB must be 0..=1024".into());
+                }
+            }
             _ => return Err("unknown Huffman option; see --help".into()),
         }
+    }
+    if let Some(decoder) = decoder {
+        // This CLI process has not started decoder workers yet. Models capture
+        // the override at construction; it never mutates a live codebook.
+        std::env::set_var("BREPAIR_HUFFMAN_DECODER", decoder);
     }
     let output = Output::new(Path::new(&args[positional - 1]))?;
     let mut pipeline = None;
@@ -97,13 +116,21 @@ pub fn run(args: &[String]) -> Result<(), String> {
             Path::new(&args[1]),
             output.path(),
             args[0] == "huffman-ids",
-            huffman_pipeline::Options::default(),
+            huffman_pipeline::Options {
+                arena_bytes: arena_mib << 20,
+                ..Default::default()
+            },
         )?;
         let totals = report.totals;
         pipeline = Some(report);
         totals
     } else {
-        huffman_archive::decode_file(Path::new(&args[1]), output.path(), args[0] == "huffman-ids")?
+        huffman_archive::decode_file_with_arena(
+            Path::new(&args[1]),
+            output.path(),
+            args[0] == "huffman-ids",
+            arena_mib << 20,
+        )?
     };
     output.commit()?;
     let seconds = start.elapsed().as_secs_f64();

@@ -1,0 +1,37 @@
+{
+  "repository": "https://github.com/reeWorlds/Fast-Large-Huffman",
+  "revision": "ada4c1cb10b45b4b9aecd3e88b50756facd4d89e",
+  "license": "Apache-2.0",
+  "upstream_files": {
+    "LICENSE": {
+      "url": "https://raw.githubusercontent.com/reeWorlds/Fast-Large-Huffman/ada4c1cb10b45b4b9aecd3e88b50756facd4d89e/LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    "Test3/BitstreamTesting/BitstreamTesting/Opt_1_3_4.cpp": {
+      "url": "https://raw.githubusercontent.com/reeWorlds/Fast-Large-Huffman/ada4c1cb10b45b4b9aecd3e88b50756facd4d89e/Test3/BitstreamTesting/BitstreamTesting/Opt_1_3_4.cpp",
+      "sha256": "d4a80b0630178b2fb8a18b0635a3bab0d2220360fd6cd080fe228f7ee63aa635"
+    },
+    "Test3/BitstreamTesting/BitstreamTesting/Opt_1_3_4.h": {
+      "url": "https://raw.githubusercontent.com/reeWorlds/Fast-Large-Huffman/ada4c1cb10b45b4b9aecd3e88b50756facd4d89e/Test3/BitstreamTesting/BitstreamTesting/Opt_1_3_4.h",
+      "sha256": "e6e04083a7161934120e5333b1c9bcdb71fe7ef715c5b1e648e8ee54ace85245"
+    },
+    "Test3/BitstreamTesting/BitstreamTesting/defines.h": {
+      "url": "https://raw.githubusercontent.com/reeWorlds/Fast-Large-Huffman/ada4c1cb10b45b4b9aecd3e88b50756facd4d89e/Test3/BitstreamTesting/BitstreamTesting/defines.h",
+      "sha256": "9a174f8999de2f6f052b094883ca5690c371636a62d02540dea1be9e7309a4b4"
+    },
+    "comparison_with_inspected_cpp": {
+      "normalized_line_endings_equal": false,
+      "difference": "Only CODES_PER_BITSTREAM changes from3 to2; Rust adaptation already uses two-code groups."
+    }
+  },
+  "rust_adaptation": "src/huffman_simd.rs",
+  "local_changes": [
+    "ordinary big-endian byte input",
+    "two-code refill groups",
+    "immutable per-model tables",
+    "checked tails and no surplus outputs",
+    "runtime CPU and <=31-bit dispatch",
+    "portable <=56-bit fallback",
+    "automatic grouped threshold >=1,048,576 codes; medium/small tables retain scalar"
+  ]
+}

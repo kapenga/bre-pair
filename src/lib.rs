@@ -1,6 +1,7 @@
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("bre-pair requires a 64-bit target for large buffers, indexes, and file sizes");
 
+pub mod api;
 pub mod archive;
 pub mod archive_io;
 pub mod atomic_output;
@@ -11,6 +12,7 @@ mod batch_experiments;
 #[cfg(feature = "bytecode-experiments")]
 pub mod bytecode;
 pub mod codec;
+pub mod columns;
 pub mod context_entropy;
 pub mod disk_seed;
 pub mod document_support;
@@ -25,6 +27,7 @@ pub mod huffman_archive;
 pub mod huffman_dictionary;
 pub mod huffman_pipeline;
 pub mod joint;
+pub mod language_prior;
 pub mod lookahead;
 pub mod maximal;
 pub mod memory;
@@ -39,6 +42,7 @@ pub mod record_frame;
 pub mod record_refit;
 pub mod registry;
 pub mod repeated;
+pub mod scalar_bonds;
 pub mod scoring;
 pub mod search;
 pub mod sequence_archive;

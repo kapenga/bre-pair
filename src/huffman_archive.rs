@@ -1237,7 +1237,15 @@ impl<R: Read + Seek> Reader<R> {
         Ok(ended)
     }
     pub fn decode_to(&mut self, token_ids: bool, out: &mut impl Write) -> Result<Totals, String> {
-        let decoder = self.prepare_decoder(token_ids, ARENA_BUDGET)?;
+        self.decode_to_with_arena(token_ids, out, ARENA_BUDGET)
+    }
+    pub fn decode_to_with_arena(
+        &mut self,
+        token_ids: bool,
+        out: &mut impl Write,
+        arena_bytes: usize,
+    ) -> Result<Totals, String> {
+        let decoder = self.prepare_decoder(token_ids, arena_bytes)?;
         let mut ended = true;
         for index in 0..self.index.len() {
             let block = self.block(index)?;
@@ -1398,6 +1406,15 @@ pub fn encode_file(
 }
 
 pub fn decode_file(input: &Path, output: &Path, token_ids: bool) -> Result<Totals, String> {
+    decode_file_with_arena(input, output, token_ids, ARENA_BUDGET)
+}
+/// Explicit cache budget; archive bytes and output semantics remain unchanged.
+pub fn decode_file_with_arena(
+    input: &Path,
+    output: &Path,
+    token_ids: bool,
+    arena_bytes: usize,
+) -> Result<Totals, String> {
     let mut encoded = BufReader::with_capacity(1 << 20, File::open(input).map_err(error)?);
     let mut magic = [0; 8];
     encoded.read_exact(&mut magic).map_err(error)?;
@@ -1408,14 +1425,14 @@ pub fn decode_file(input: &Path, output: &Path, token_ids: bool) -> Result<Total
             return Err("byte grammar has no frozen AI token IDs".into());
         }
         let mut out = BufWriter::with_capacity(1 << 20, File::create_new(output).map_err(error)?);
-        return reader.decode_to(&mut out, token_ids);
+        return reader.decode_to_with_arena(&mut out, token_ids, arena_bytes);
     }
     let mut reader = Reader::new(encoded)?;
     if token_ids && !reader.dictionary.ai_tokens {
         return Err("byte grammar has no frozen AI token IDs".into());
     }
     let mut out = BufWriter::with_capacity(1 << 20, File::create_new(output).map_err(error)?);
-    reader.decode_to(token_ids, &mut out)
+    reader.decode_to_with_arena(token_ids, &mut out, arena_bytes)
 }
 
 pub fn pack_file(input: &Path, output: &Path, block_size: usize) -> Result<Totals, String> {

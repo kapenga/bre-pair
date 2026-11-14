@@ -27,6 +27,9 @@ mod arity_cost;
 #[path = "record_model.rs"]
 mod record_model;
 pub use record_model::StaticModel;
+#[cfg(feature = "bytecode-experiments")]
+#[path = "bytecode/archive.rs"]
+pub mod byte_archive;
 #[path = "huffman_table_projection.rs"]
 mod table_projection;
 pub use table_projection::{project_tables, TableProjection};
@@ -1268,6 +1271,9 @@ pub struct Reader<R> {
     index_offset: u64,
 }
 impl<R: Read + Seek> Reader<R> {
+    pub fn static_codebook(&self) -> Option<&Codebook> {
+        self.book.as_deref()
+    }
     pub fn new(mut input: R) -> Result<Self, String> {
         let size = input.seek(SeekFrom::End(0)).map_err(error)?;
         input.seek(SeekFrom::Start(0)).map_err(error)?;
@@ -1475,10 +1481,18 @@ impl<R: Read + Seek> Reader<R> {
     }
 
     pub fn decode_to(&mut self, out: &mut impl Write, ids: bool) -> Result<Totals, String> {
+        self.decode_to_with_arena(out, ids, 64 << 20)
+    }
+    pub fn decode_to_with_arena(
+        &mut self,
+        out: &mut impl Write,
+        ids: bool,
+        arena_bytes: usize,
+    ) -> Result<Totals, String> {
         if ids && !self.ai_tokens {
             return Err("byte archive has no frozen AI token IDs".into());
         }
-        let decoder = self.prepare_decoder(ids, 64 << 20)?;
+        let decoder = self.prepare_decoder(ids, arena_bytes)?;
         let mut totals = Totals::default();
         let mut ended = true;
         for i in 0..self.index.len() {

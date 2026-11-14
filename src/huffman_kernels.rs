@@ -1,5 +1,11 @@
 //! Validated bulk decoder and optional matched hot-loop experiments.
 use super::Codebook;
+#[path = "huffman_simd.rs"]
+mod simd;
+pub(super) use simd::GroupedTables;
+// The full-archive screen regressed on 67K--448K codebooks. Limit automatic
+// SIMD to very large alphabets; forced research kernels remain available.
+pub(super) const AUTO_AVX2_MIN_SYMBOLS: usize = 1 << 20;
 
 #[cfg(any(test, feature = "huffman-kernels"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10,16 +16,18 @@ pub enum Kernel {
     BulkPrefixOverlap,
     BulkLinearOverlap,
     WindowPrefix,
+    GroupedAvx2,
 }
 #[cfg(any(test, feature = "huffman-kernels"))]
 impl Kernel {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Reference,
         Self::OffsetChecked,
         Self::BulkPrefix,
         Self::BulkPrefixOverlap,
         Self::BulkLinearOverlap,
         Self::WindowPrefix,
+        Self::GroupedAvx2,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -29,6 +37,7 @@ impl Kernel {
             Self::BulkPrefixOverlap => "bulk-prefix-overlap",
             Self::BulkLinearOverlap => "bulk-linear-overlap",
             Self::WindowPrefix => "window-prefix",
+            Self::GroupedAvx2 => "grouped-avx2",
         }
     }
 }
@@ -131,6 +140,7 @@ impl Codebook {
                 self.decode_bulk::<false, false>(payload, bits, count, emit)
             }
             Kernel::WindowPrefix => self.decode_window(payload, bits, count, emit),
+            Kernel::GroupedAvx2 => self.decode_dispatch::<true>(payload, bits, count, emit),
         }
     }
     fn validate_payload(&self, payload: &[u8], bits: u64, count: u64) -> Result<(), String> {

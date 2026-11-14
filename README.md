@@ -21,6 +21,9 @@ executable is **`brepair`**.
 - Byte reconstruction or preserved AI-token-ID output from token-compatible
   compressed streams, using a single-thread decoder or four-stage pipeline.
 - Byte-exact input handling, including invalid UTF-8; no normalization.
+- Rust and Python APIs sharing immutable vocabularies with per-worker scratch.
+- Independent column models and optional byte-aligned archive transport.
+- Automatic scalar/AVX2 Huffman dispatch with attributed Apache-2.0 code.
 
 This is an early research implementation. Pin a commit when reproducing a
 result. Additional experimental executables live in `src/bin/`; ordinary use
@@ -141,6 +144,39 @@ allocation failures stop with an error. Keep source data until restoration
 has been verified. `--report FILE.json` is available on the principal training
 and compression commands; `brepair --help` lists each command's options.
 
+## Python and column APIs
+
+```sh
+python -m pip install .
+```
+
+```python
+from brepair import Tokenizer
+
+with Tokenizer("tokenizer.brt") as tokenizer:
+    raw = b"Hello world!"
+    assert tokenizer.decode(tokenizer.encode(raw)) == raw
+```
+
+Python 3.10+ is required. Source installation builds the native library and
+CLI with Rust; tokenization does not invoke a Python implementation of the
+parser. See the [package guide](python/README.md) for fields, shared models,
+column compression and bounded file workflows.
+
+`brepair columns` trains one model per lexical column and reconstructs the
+original unquoted pipe-separated bytes. Quoted CSV with embedded separators
+or newlines requires an extraction adapter. Byte-aligned archive tools remain
+feature-gated; see [payload formats](docs/payloads.md).
+
+## Benchmarks
+
+The [compression benchmark companion](benchmarks/compression-paper-v1/) contains
+complete tables, protocols, per-run measurements and exact measured-source
+snapshots. Whole files, continuous columns and independent records have
+different access contracts. CPU, memory and IO scopes are stated alongside
+results. The current code and the frozen measured build are separately pinned.
+The main manuscript is still under author review.
+
 ## Development
 
 `src/` contains the library and CLI, and `tests/` contains Rust integration
@@ -165,7 +201,10 @@ Re-Pair and canonical Huffman coding are established techniques. BRe-Pair is
 developed by **Wybren Kapenga**, with implementation, testing and documentation
 assistance from **OpenAI Codex**. The release decoder follows Kapenga's
 Decoder2 design with the project's prefix-length and refill optimizations.
-External comparison implementations are not bundled.
+Large-alphabet AVX2 decoding adapts Zavadskyi and Kovalchuk's
+Fast-Large-Huffman under Apache-2.0; its license and exact revision are in
+[third-party notices](THIRD-PARTY-NOTICES.md). Other comparison implementations
+remain separate from the library. See [decoder dispatch](docs/decoder.md).
 
 Project source is licensed under **Apache-2.0**. See [LICENSE](LICENSE),
 [NOTICE](NOTICE) and [third-party notices](THIRD-PARTY-NOTICES.md).

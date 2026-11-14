@@ -282,7 +282,10 @@ impl Arena {
             while let Some(child) = pending.pop() {
                 let r = references[child];
                 let end = r.offset as usize + r.length as usize;
-                if end <= start {
+                // Bytes before cursor are already filled, including earlier
+                // children of this placement. Reuse those slices too: repeated
+                // subtrees must not expand one literal at a time during setup.
+                if end <= cursor {
                     bytes.copy_within(r.offset as usize..end, cursor);
                     cursor += r.length as usize;
                 } else if let Some(terminal) = dictionary.terminal(child) {

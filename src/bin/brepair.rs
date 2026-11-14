@@ -53,9 +53,11 @@ brepair verify MODEL.brt INPUT.bts ORIGINAL\n\
 brepair ids MODEL.brt INPUT OUTPUT.ids\n\
 brepair decompress CANDIDATES.brp OUTPUT\n\
 brepair inspect MODEL.brt\n\n\
+brepair columns split INPUT NEW_DIRECTORY COLUMNS (unquoted PSV)\n\
+brepair columns restore COLUMN_DIRECTORY NEW_OUTPUT\n\n\
 brepair huffman-pack INPUT.brp OUTPUT.brh [--block-symbols 1048576]\n\
 brepair huffman-encode MODEL.brt INPUT OUTPUT.brh [--block-symbols 1048576]\n\
-brepair huffman-decode INPUT.brh OUTPUT [--threads 1|4]\n\
+brepair huffman-decode INPUT.brh OUTPUT [--threads 1|4] [--decoder auto|scalar|avx2] [--arena-mib 64]\n\
 brepair huffman-ids INPUT.brh OUTPUT.ids [--threads 1|4]\n\
 brepair huffman-inspect INPUT.brh\n\n\
 brepair huffman-repack INPUT.brhv OUTPUT.brhv [--rule-lengths auto|varint|runs]\n\n\
@@ -345,6 +347,9 @@ fn run() -> Result<(), String> {
     if args[0] == "--version" {
         println!("brepair {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+    if args[0] == "columns" {
+        return bre_pair::columns::run_cli(&args[1..]);
     }
     let mut requested = None;
     let mut verbose = false;

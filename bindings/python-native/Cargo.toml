@@ -1,0 +1,21 @@
+[package]
+name = "bre-pair-python-native"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "bre_pair_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+bre-pair = { path = "../.." }
+
+[profile.dist]
+inherits = "release"
+debug = false
+strip = "symbols"
+lto = "thin"
+codegen-units = 1

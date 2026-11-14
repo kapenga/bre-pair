@@ -24,6 +24,16 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+/// Observe finished selection only: no counters or candidate ordering are mutated.
+/// Counts include nonoverlapping replacements and remain 64-bit throughout.
+pub(crate) fn wave(number: usize, pairs: &[crate::batch::Candidate]) {
+    if enabled() {
+        let selected_pairs = pairs.len();
+        let replacements: u64 = pairs.iter().map(|p| p.count).sum();
+        eprintln!("codec wave {{\"event\":\"wave\",\"wave\":{number},\"selected_pairs\":{selected_pairs},\"selected_replacements\":{replacements}}}");
+    }
+}
+
 pub fn frontier(round: usize, candidates: usize, maximum: u64, threshold: u64) {
     if enabled() {
         eprintln!("codec frontier {{\"event\":\"frontier\",\"round\":{round},\"candidates\":{candidates},\"maximum_pair_count\":{maximum},\"stop_max_pair_count\":{threshold}}}");

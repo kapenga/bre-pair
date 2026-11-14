@@ -2,7 +2,16 @@
 //! Codes use the existing canonical rank order, avoiding an extra permutation.
 use crate::huffman::Codebook;
 use std::ops::Range;
+pub mod scannable;
 pub type Tables<'a> = (&'a [u8], &'a [(u32, u32)]);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DecodedBlock {
+    pub bytes: usize,
+    pub fields: u64,
+    pub symbols: u64,
+    pub ended: bool,
+}
 
 #[derive(Clone, Copy, Default)]
 struct Lead {
@@ -125,6 +134,22 @@ impl ByteCodes {
         }
         out
     }
+    /// Checked standalone rank decode, also used for an oversized cached symbol.
+    pub fn decode_rank(&self, input: &[u8]) -> Result<(u32, usize), String> {
+        let entry = self.lead[usize::from(*input.first().ok_or("missing byte code")?)];
+        let length = entry.bytes as usize;
+        if length == 0 || length > input.len() {
+            return Err("invalid or truncated byte code".into());
+        }
+        let mut bytes = [0; 4];
+        bytes[..length].copy_from_slice(&input[..length]);
+        let rank = entry
+            .base
+            .checked_add((u32::from_le_bytes(bytes) >> 8) & entry.mask)
+            .filter(|&rank| (rank as usize) < self.symbols)
+            .ok_or("undefined byte rank")?;
+        Ok((rank, length))
+    }
     pub fn from_metadata(symbols: usize, data: &[u8]) -> Result<Self, String> {
         if data.len() != 16 || &data[..8] != b"BRBYTE01" {
             return Err("invalid byte-code metadata".into());
@@ -157,6 +182,17 @@ impl<'a> Expansions<'a> {
     }
     pub fn ends_field(&self, rank: u32) -> bool {
         self.references[rank as usize].1 >> 31 != 0
+    }
+    /// Borrow a fully cached expansion; no temporary giant output allocation.
+    pub fn rank_bytes(&self, rank: u32) -> Result<(&[u8], bool), String> {
+        let &(offset, flags) = self
+            .references
+            .get(rank as usize)
+            .ok_or("undefined byte rank")?;
+        Ok((
+            &self.arena[offset as usize..offset as usize + (flags & 0x7fff_ffff) as usize],
+            flags >> 31 != 0,
+        ))
     }
     #[inline(always)]
     fn emit(
@@ -230,7 +266,8 @@ impl<'a> Expansions<'a> {
         out: &mut [u8],
         maximum: usize,
     ) -> Result<usize, String> {
-        self.byte_range::<true>(codes, input, range, out, maximum)
+        self.byte_range::<true, false>(codes, input, range, out, maximum)
+            .map(|result| result.bytes)
     }
     pub fn byte_block(
         &self,
@@ -240,7 +277,19 @@ impl<'a> Expansions<'a> {
         out: &mut [u8],
         maximum: usize,
     ) -> Result<usize, String> {
-        self.byte_range::<false>(codes, input, range, out, maximum)
+        self.byte_range::<false, false>(codes, input, range, out, maximum)
+            .map(|result| result.bytes)
+    }
+    /// Full-stream validation counts EOF and ranks in the existing decode loop.
+    pub fn byte_block_checked(
+        &self,
+        codes: &ByteCodes,
+        input: &[u8],
+        range: Range<usize>,
+        out: &mut [u8],
+        maximum: usize,
+    ) -> Result<DecodedBlock, String> {
+        self.byte_range::<false, true>(codes, input, range, out, maximum)
     }
     pub fn fixed_field(
         &self,
@@ -281,14 +330,14 @@ impl<'a> Expansions<'a> {
         Err("fixed field lacks EOF".into())
     }
     #[inline]
-    fn byte_range<const FIELD: bool>(
+    fn byte_range<const FIELD: bool, const COUNT: bool>(
         &self,
         codes: &ByteCodes,
         input: &[u8],
         range: Range<usize>,
         out: &mut [u8],
         maximum: usize,
-    ) -> Result<usize, String> {
+    ) -> Result<DecodedBlock, String> {
         if range.start > range.end
             || range.end.checked_add(3).is_none_or(|end| end > input.len())
             || out.len() < 16
@@ -299,6 +348,7 @@ impl<'a> Expansions<'a> {
         }
         let mut at = range.start;
         let mut used = 0;
+        let mut result = DecodedBlock::default();
         while at < range.end {
             // A single wide load covers the lead and up to three suffix bytes.
             // Bounds above prove the speculative bytes are readable.
@@ -311,20 +361,30 @@ impl<'a> Expansions<'a> {
             if entry.bytes == 0 || entry.bytes as usize > range.end - at {
                 return Err("invalid/truncated byte code".into());
             }
-            let rank = entry.base + ((word >> 8) & entry.mask);
+            let rank = entry
+                .base
+                .checked_add((word >> 8) & entry.mask)
+                .ok_or("byte-code rank overflow")?;
             at += entry.bytes as usize;
             let ended = self.emit(rank, out, &mut used, maximum)?;
+            if COUNT {
+                result.symbols += 1;
+                result.fields += u64::from(ended);
+                result.ended = ended;
+            }
             if FIELD && ended {
                 if at != range.end {
                     return Err("bytes after field EOF".into());
                 }
-                return Ok(used);
+                result.bytes = used;
+                return Ok(result);
             }
         }
         if FIELD {
             Err("byte field lacks EOF".into())
         } else {
-            Ok(used)
+            result.bytes = used;
+            Ok(result)
         }
     }
 }

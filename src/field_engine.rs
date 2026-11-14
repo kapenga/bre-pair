@@ -92,6 +92,7 @@ enum Input<'a> {
     Bytes(&'a [Vec<u8>]),
     Packed(Compressed),
     Utf8Packed(Compressed, f64),
+    LanguagePacked(Compressed, &'a crate::language_prior::Policy),
     Segments(Compressed),
     Seeded(Compressed, Vec<bool>, Option<MergeBlock>),
     Documented(Compressed, Vec<bool>, &'a crate::document_support::Policy),
@@ -147,6 +148,7 @@ pub fn compress_file(
         options,
         true,
         None,
+        None,
         on_round,
     )
 }
@@ -167,6 +169,7 @@ pub fn compress_file_single_field(
         chunk_symbols,
         options,
         false,
+        None,
         None,
         on_round,
     )
@@ -245,6 +248,34 @@ pub fn compress_file_utf8_prior(
         options,
         true,
         Some(bonus),
+        None,
+        on_round,
+    )
+}
+
+/// Research-only weighted discovery. Counts/eligibility and the shared
+/// registry remain raw; a separate bounded pass supplies weighted priorities.
+pub fn compress_file_language_weighted(
+    path: &std::path::Path,
+    policy: &crate::language_prior::Policy,
+    config: &Config,
+    workers: usize,
+    chunk_symbols: usize,
+    options: Options,
+    on_round: impl FnMut(&Round),
+) -> Result<ParallelTraining, String> {
+    if config.score != Model::WeightedPmi || options.shake.is_some() {
+        return Err("language-weighted discovery requires merge-only weighted PMI".into());
+    }
+    compress_file_with_prior(
+        path,
+        config,
+        workers,
+        chunk_symbols,
+        options,
+        true,
+        None,
+        Some(policy),
         on_round,
     )
 }
@@ -258,6 +289,7 @@ fn compress_file_with_prior(
     options: Options,
     split_lines: bool,
     utf8_bonus: Option<f64>,
+    language_prior: Option<&crate::language_prior::Policy>,
     on_round: impl FnMut(&Round),
 ) -> Result<ParallelTraining, String> {
     use std::io::BufRead;
@@ -273,7 +305,20 @@ fn compress_file_with_prior(
     let mut next_progress = 64 * 1024 * 1024u64;
     crate::training_progress::phase("packing", 0, 0, input_total, "bytes");
     let mut blocks = Vec::new();
-    let mut block = PackedSymbols::with_capacity(9, chunk_symbols);
+    let mut language_chunks = Vec::new();
+    let (mut language_start, mut language_first_field) = (0, 0);
+    // A single field cannot flush at line boundaries. Its final symbol count
+    // is known, so avoid geometric growth and a second full allocation during
+    // shrink_to_fit at EOF. Line-delimited ingestion keeps bounded chunks.
+    let initial_symbols = if split_lines {
+        chunk_symbols
+    } else {
+        usize::try_from(input_total)
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .ok_or("single-field symbol count exceeds addressable memory")?
+    };
+    let mut block = PackedSymbols::with_capacity(9, initial_symbols);
     let mut input_bytes = 0u64;
     let mut field_count = 0u64;
     let mut open = false;
@@ -296,6 +341,16 @@ fn compress_file_with_prior(
                 field_count += 1;
                 open = false;
                 if block.len() >= chunk_symbols {
+                    if language_prior.is_some() {
+                        language_chunks.push(crate::language_prior::Chunk {
+                            start: language_start,
+                            end: input_bytes,
+                            first_field: language_first_field,
+                            fields: field_count - language_first_field,
+                        });
+                        language_start = input_bytes;
+                        language_first_field = field_count;
+                    }
                     block.shrink_to_fit();
                     allocated = allocated
                         .checked_add(block.allocated_bytes())
@@ -328,6 +383,14 @@ fn compress_file_with_prior(
         field_count += 1;
     }
     if !block.is_empty() {
+        if language_prior.is_some() {
+            language_chunks.push(crate::language_prior::Chunk {
+                start: language_start,
+                end: input_bytes,
+                first_field: language_first_field,
+                fields: field_count - language_first_field,
+            });
+        }
         block.shrink_to_fit();
         blocks.push(block);
     } else {
@@ -349,7 +412,15 @@ fn compress_file_with_prior(
     );
     let source = match utf8_bonus {
         Some(bonus) => Input::Utf8Packed(source, bonus),
-        None => Input::Packed(source),
+        None => {
+            if let Some(policy) = language_prior {
+                policy.validate_totals(input_bytes, field_count)?;
+                policy.set_chunks(language_chunks)?;
+                Input::LanguagePacked(source, policy)
+            } else {
+                Input::Packed(source)
+            }
+        }
     };
     if options.frequency_cutoff {
         compress_inner::<true>(
@@ -920,10 +991,15 @@ fn compress_inner<const FILTER: bool>(
         _ => 0.0,
     };
     let mut utf8_prior = (utf8_bonus > 0.0).then(crate::utf8_prior::JoinPrior::new);
+    let language_prior = match &input {
+        Input::LanguagePacked(_, policy) => Some(*policy),
+        _ => None,
+    };
     let prepacked = matches!(
         &input,
         Input::Packed(_)
             | Input::Utf8Packed(..)
+            | Input::LanguagePacked(..)
             | Input::Segments(_)
             | Input::Seeded(..)
             | Input::Documented(..)
@@ -932,7 +1008,10 @@ fn compress_inner<const FILTER: bool>(
     let segmented = matches!(&input, Input::Segments(_));
     let (mut grammar, mut blocks, input_bytes, field_count, mut membership, mut blocked, documents) =
         match input {
-            Input::Packed(source) | Input::Utf8Packed(source, _) | Input::Segments(source) => (
+            Input::Packed(source)
+            | Input::Utf8Packed(source, _)
+            | Input::LanguagePacked(source, _)
+            | Input::Segments(source) => (
                 source.grammar,
                 source.blocks,
                 source.input_bytes,
@@ -1264,6 +1343,17 @@ fn compress_inner<const FILTER: bool>(
                     config.pmi_alpha,
                 );
             }
+        }
+        if let Some(prior) = language_prior {
+            prior.score(
+                &mut candidates,
+                stats.as_ref().expect("weighted PMI statistics"),
+                &blocks,
+                &grammar,
+                rounds.len() + 1,
+                config.pmi_alpha,
+                workers,
+            )?;
         }
         if let Some(prior) = &mut utf8_prior {
             prior.sync(&grammar);

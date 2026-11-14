@@ -1,0 +1,8 @@
+include Cargo.toml Cargo.lock LICENSE NOTICE THIRD-PARTY-NOTICES.md
+include python/README.md
+recursive-include .cargo *.toml
+recursive-include src *.rs
+recursive-include bindings/python-native Cargo.toml Cargo.lock *.rs
+recursive-include python/brepair *.py
+recursive-include third-party *.txt *.json
+prune bindings/python-native/target

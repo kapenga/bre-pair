@@ -1,7 +1,8 @@
 //! Canonical, MSB-first Huffman codes. Decoding uses Decoder2-style high-aligned
 //! range boundaries, not a tree walk or a table exponential in code length.
-//! The release path retains the owner's Decoder2-style range search, a 4 KiB
-//! prefix-to-length lookup and bounded wide refills with a checked tail.
+//! Large eligible AVX2 tables use the licensed Zavadskyi/Kovalchuk grouped
+//! backend. The owner's Decoder2-style path remains the portable/long-code
+//! fallback, with prefix-length lookup and bounded refills. See huffman_simd.rs.
 use std::{cmp::Reverse, collections::BinaryHeap};
 
 pub const MAX_BITS: usize = 56;
@@ -31,6 +32,8 @@ pub struct Codebook {
     // length-range boundary need the compact range scan. Just 4 KiB even
     // for millions of symbols and 56-bit codes.
     prefix_lengths: Box<[u8; 4096]>,
+    grouped: Option<Box<kernels::GroupedTables>>,
+    force_grouped: bool,
     pub max_bits: u8,
 }
 
@@ -155,6 +158,8 @@ impl Codebook {
             bias: [0; MAX_BITS + 1],
             boundaries: Vec::new(),
             prefix_lengths: Box::new([0; 4096]),
+            grouped: None,
+            force_grouped: false,
             max_bits: 0,
         };
         for (id, len) in entries {
@@ -207,6 +212,23 @@ impl Codebook {
                 book.prefix_lengths[prefix] = a.unwrap_or(0);
             }
         }
+        // Process-local benchmark/CLI override, captured at construction. No
+        // environment lookup or mutable global policy in the decoding loop.
+        let backend = std::env::var("BREPAIR_HUFFMAN_DECODER").unwrap_or_else(|_| "auto".into());
+        if !matches!(backend.as_str(), "auto" | "scalar" | "avx2") {
+            return Err("BREPAIR_HUFFMAN_DECODER must be auto, scalar or avx2".into());
+        }
+        book.force_grouped = backend == "avx2";
+        if backend != "scalar"
+            && (book.force_grouped
+                || book.symbols.len() >= kernels::AUTO_AVX2_MIN_SYMBOLS
+                || cfg!(any(test, feature = "huffman-kernels")))
+        {
+            book.grouped = kernels::GroupedTables::new(&book).map(Box::new);
+        }
+        // A requested kernel is a preference: long/singleton tables and CPUs
+        // without AVX2 still decode safely, including metadata codebooks.
+        book.force_grouped &= book.grouped.is_some();
         Ok(book)
     }
 
@@ -215,6 +237,18 @@ impl Codebook {
             .iter()
             .copied()
             .zip(self.lengths.iter().copied())
+    }
+
+    /// Default block backend for this validated table on the current CPU.
+    /// Short EOF fields and forced research kernels have separate entry points.
+    pub fn decoder_backend(&self) -> &'static str {
+        if self.grouped.is_some()
+            && (self.force_grouped || self.symbols.len() >= kernels::AUTO_AVX2_MIN_SYMBOLS)
+        {
+            "grouped-avx2"
+        } else {
+            "decoder2"
+        }
     }
 
     pub fn encode(&self, ids: &[u32]) -> Result<(Vec<u8>, u64), String> {
@@ -337,7 +371,7 @@ impl Codebook {
         count: u64,
         emit: impl FnMut(u32) -> Result<(), String>,
     ) -> Result<(), String> {
-        self.decode_bulk::<true, false>(payload, bit_count, count, emit)
+        self.decode_dispatch::<false>(payload, bit_count, count, emit)
     }
     fn decode_ranks_reference(
         &self,
